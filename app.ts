@@ -39,13 +39,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
+/** The path of a request URL, without a `new URL` parse (routing never needs
+ *  the query, origin or dot-segment normalisation; handlers that do parse the
+ *  query do it themselves). Falls back to '/' for a malformed URL. */
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const path = q < 0 ? raw : raw.slice(0, q);
+  return path === '' ? '/' : path;
 }
 
 /** The JSON API surfaces whose requests need the bearer token (see below). */
@@ -93,9 +94,9 @@ export function createApp(): Server {
 
     const baseUrl = `http://${req.headers.host ?? 'localhost'}`;
     const viewerLogin = store.viewerLogin ?? undefined;
-    if (mcpHandler(req, res, viewerLogin === undefined ? undefined : { viewer: viewerLogin })) return;
-    if (restHandler(req, res, { baseUrl, viewerLogin })) return;
-    if (graphqlHandler(req, res, { baseUrl, viewerLogin })) return;
+    if (mcpHandler(req, res, viewerLogin === undefined ? { path } : { viewer: viewerLogin, path })) return;
+    if (restHandler(req, res, { baseUrl, viewerLogin, path })) return;
+    if (graphqlHandler(req, res, { baseUrl, viewerLogin, path })) return;
 
     // Everything else, every method: GitHub's 404 body.
     sendJson(res, 404, { message: 'Not Found' });

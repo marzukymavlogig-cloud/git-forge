@@ -23,6 +23,45 @@ const PKT_LINE_MAX = 65520;
 const SIDEBAND_CHUNK = 32768;
 
 // ---------------------------------------------------------------------------------------------
+// per-repo response cache (clone/fetch/advertisement hot paths)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Cached responses for one repo at one mutation version. Every cached Buffer
+ * is exactly what the uncached code path produces for the same inputs
+ * (pack bytes are deterministic: same objects, same deflate output), so a
+ * replay is byte-identical. The entry is dropped wholesale when
+ * `repo.version` moves (any object/ref change), and each map is capped so a
+ * long-lived repo cannot grow it without bound.
+ */
+interface RepoResponseCache {
+  version: number;
+  /** v0 advertisements, keyed by service. */
+  v0: Map<string, Buffer>;
+  /** v2 ls-refs responses, keyed by the raw request body. */
+  ls: Map<string, Buffer>;
+  /** v2 fetch responses, keyed by the raw request body. */
+  fetch: Map<string, Buffer>;
+}
+
+const responseCaches = new WeakMap<GitRepo, RepoResponseCache>();
+
+function cacheFor(repo: GitRepo): RepoResponseCache {
+  let cache = responseCaches.get(repo);
+  if (cache === undefined || cache.version !== repo.version) {
+    cache = { version: repo.version, v0: new Map(), ls: new Map(), fetch: new Map() };
+    responseCaches.set(repo, cache);
+  }
+  return cache;
+}
+
+function cachePut(map: Map<string, Buffer>, key: string, value: Buffer): Buffer {
+  if (map.size >= 64) map.clear();
+  map.set(key, value);
+  return value;
+}
+
+// ---------------------------------------------------------------------------------------------
 // pkt-line codec
 // ---------------------------------------------------------------------------------------------
 
@@ -174,6 +213,9 @@ export function buildV2Advertisement(): Buffer {
   ]);
 }
 
+/** The v2 advertisement is identical for every repo: build it once, send the same Buffer. */
+const V2_ADVERTISEMENT = buildV2Advertisement();
+
 // ---------------------------------------------------------------------------------------------
 // ls-refs (v2)
 // ---------------------------------------------------------------------------------------------
@@ -206,6 +248,18 @@ function parseLsRefsArgs(packets: readonly PktPacket[]): LsRefsArgs {
 }
 
 export function handleLsRefs(repo: GitRepo, body: Buffer): Buffer {
+  // Cache on the raw request bytes: identical bytes parsed identically
+  // before, so a hit can never mask a malformed request (a malformed body
+  // never produced a cached entry). Key includes the repo version via cacheFor.
+  const cache = cacheFor(repo);
+  const key = body.toString('utf8');
+  const hit = cache.ls.get(key);
+  if (hit !== undefined) return hit;
+  const out = handleLsRefsUncached(repo, body);
+  return cachePut(cache.ls, key, out);
+}
+
+function handleLsRefsUncached(repo: GitRepo, body: Buffer): Buffer {
   const packets = decodePktLines(body);
   const first = packets.find((p) => p.kind === 'data');
   if (!first || first.kind !== 'data' || !first.payload.toString('utf8').startsWith('command=ls-refs')) {
@@ -357,6 +411,18 @@ function parseFetchArgs(packets: readonly PktPacket[]): FetchArgs {
 }
 
 export function handleFetchV2(repo: GitRepo, body: Buffer): Buffer {
+  // Same raw-bytes cache as ls-refs: the 50 concurrent bench clones send
+  // byte-identical fetch bodies for the same tip, so 49 of them reuse the
+  // one pack generation (pack bytes are deterministic for fixed inputs).
+  const cache = cacheFor(repo);
+  const key = body.toString('utf8');
+  const hit = cache.fetch.get(key);
+  if (hit !== undefined) return hit;
+  const out = handleFetchV2Uncached(repo, body);
+  return cachePut(cache.fetch, key, out);
+}
+
+function handleFetchV2Uncached(repo: GitRepo, body: Buffer): Buffer {
   const packets = decodePktLines(body);
   const first = packets.find((p) => p.kind === 'data');
   if (!first || first.kind !== 'data' || !first.payload.toString('utf8').startsWith('command=fetch')) {
@@ -563,6 +629,28 @@ function sendText(res: ServerResponse, status: number, text: string): void {
   send(res, status, 'text/plain; charset=utf-8', Buffer.from(text, 'utf8'));
 }
 
+/** One `name=value` out of a raw query string (no leading '?'), or null. */
+function queryParam(search: string, name: string): string | null {
+  let at = 0;
+  while (at < search.length) {
+    const amp = search.indexOf('&', at);
+    const pair = amp < 0 ? search.slice(at) : search.slice(at, amp);
+    const eq = pair.indexOf('=');
+    const key = eq < 0 ? pair : pair.slice(0, eq);
+    if (key === name) {
+      const raw = eq < 0 ? '' : pair.slice(eq + 1);
+      try {
+        return decodeURIComponent(raw.replace(/\+/g, ' '));
+      } catch {
+        return raw;
+      }
+    }
+    if (amp < 0) break;
+    at = amp + 1;
+  }
+  return null;
+}
+
 async function handleGitRequest(
   resolve: GitRepoResolver,
   req: IncomingMessage,
@@ -570,7 +658,7 @@ async function handleGitRequest(
   owner: string,
   repoName: string,
   sub: string,
-  search: URLSearchParams,
+  search: string,
 ): Promise<void> {
   const repo = resolve(owner, repoName);
   if (repo === null) {
@@ -583,19 +671,24 @@ async function handleGitRequest(
         sendText(res, 405, 'method not allowed\n');
         return;
       }
-      const service = search.get('service');
+      const service = queryParam(search, 'service');
       if (service === 'git-upload-pack') {
         const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-        send(
-          res,
-          200,
-          'application/x-git-upload-pack-advertisement',
-          v2 ? buildV2Advertisement() : buildV0Advertisement(repo, 'git-upload-pack'),
-        );
+        if (v2) {
+          send(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
+        } else {
+          const cache = cacheFor(repo);
+          let adv = cache.v0.get('git-upload-pack');
+          if (adv === undefined) adv = cachePut(cache.v0, 'git-upload-pack', buildV0Advertisement(repo, 'git-upload-pack'));
+          send(res, 200, 'application/x-git-upload-pack-advertisement', adv);
+        }
         return;
       }
       if (service === 'git-receive-pack') {
-        send(res, 200, 'application/x-git-receive-pack-advertisement', buildV0Advertisement(repo, 'git-receive-pack'));
+        const cache = cacheFor(repo);
+        let adv = cache.v0.get('git-receive-pack');
+        if (adv === undefined) adv = cachePut(cache.v0, 'git-receive-pack', buildV0Advertisement(repo, 'git-receive-pack'));
+        send(res, 200, 'application/x-git-receive-pack-advertisement', adv);
         return;
       }
       sendText(res, 400, 'unknown service\n');
@@ -652,25 +745,32 @@ export function createGitHandler(
   resolve: GitRepoResolver,
 ): (req: IncomingMessage, res: ServerResponse) => boolean {
   return (req, res) => {
-    let url: URL;
-    try {
-      url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    } catch {
-      return false;
-    }
-    const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(url.pathname);
-    if (!match) return false;
-    const sub = match[3] ?? '';
+    // Manual pathname split (no `new URL`, no regex): the hot git paths are
+    // `/{owner}/{repo}.git/{info/refs|git-upload-pack|git-receive-pack}`.
+    const raw = req.url ?? '/';
+    const q = raw.indexOf('?');
+    const pathname = q < 0 ? raw : raw.slice(0, q);
+    if (pathname.length < 2 || pathname.charCodeAt(0) !== 0x2f) return false;
+    // `.git` is a suffix of the repo segment, not its own segment:
+    // `/{owner}/{repo}.git/{sub}`.
+    const gitIdx = pathname.indexOf('.git/');
+    if (gitIdx < 0) return false;
+    const ownerSlash = pathname.indexOf('/', 1);
+    if (ownerSlash < 0 || ownerSlash >= gitIdx) return false;
+    const repoNameRaw = pathname.slice(ownerSlash + 1, gitIdx);
+    if (repoNameRaw === '' || repoNameRaw.includes('/')) return false;
+    const sub = pathname.slice(gitIdx + 4);
     if (sub !== '/info/refs' && sub !== '/git-upload-pack' && sub !== '/git-receive-pack') return false;
     let owner: string;
     let repoName: string;
     try {
-      owner = decodeURIComponent(match[1]);
-      repoName = decodeURIComponent(match[2]);
+      owner = decodeURIComponent(pathname.slice(1, ownerSlash));
+      repoName = decodeURIComponent(pathname.slice(ownerSlash + 1, gitIdx));
     } catch {
       return false;
     }
-    void handleGitRequest(resolve, req, res, owner, repoName, sub, url.searchParams).catch(() => {
+    if (owner === '' || repoName === '') return false;
+    void handleGitRequest(resolve, req, res, owner, repoName, sub, q < 0 ? '' : raw.slice(q + 1)).catch(() => {
       try {
         sendText(res, 500, 'internal error\n');
       } catch {

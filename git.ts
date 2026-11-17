@@ -701,17 +701,28 @@ export class GitRepo {
   readonly refs = new Map<string, string>();
   /** Symref target of HEAD (default branch). */
   headTarget = 'refs/heads/main';
+  /**
+   * Mutation counter: bumped whenever an object or ref actually changes.
+   * Response caches in gitproto.ts key off it, so a cached advertisement /
+   * pack is only reused while the repo is byte-identical to when it was built.
+   */
+  version = 0;
 
   getRef(name: string): string | undefined {
     return this.refs.get(name);
   }
 
   setRef(name: string, oid: string): void {
-    this.refs.set(name, oid);
+    if (this.refs.get(name) !== oid) {
+      this.refs.set(name, oid);
+      this.version += 1;
+    }
   }
 
   deleteRef(name: string): boolean {
-    return this.refs.delete(name);
+    const deleted = this.refs.delete(name);
+    if (deleted) this.version += 1;
+    return deleted;
   }
 
   /** Refs sorted by name: [{ name, oid }]. */
@@ -738,7 +749,10 @@ export class GitRepo {
   putObject(type: GitObjectType, data: Uint8Array): string {
     const body = asBuffer(data);
     const oid = hashObject(type, body);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data: body });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data: body });
+      this.version += 1;
+    }
     return oid;
   }
 
@@ -753,7 +767,17 @@ export class GitRepo {
    */
   applyPack(pack: Uint8Array): Map<string, GitObject> {
     const parsed = readPack(pack, { resolveBase: (oid) => this.objects.get(oid) });
-    this.putObjects(parsed.objects.values());
+    // readPack already recomputed every object's SHA-1 and checked its size,
+    // so store the resolved objects directly instead of re-hashing each one
+    // through putObject (the push path pays one SHA-1 per object, not two).
+    let changed = false;
+    for (const [oid, object] of parsed.objects) {
+      if (!this.objects.has(oid)) {
+        this.objects.set(oid, object);
+        changed = true;
+      }
+    }
+    if (changed) this.version += 1;
     return parsed.objects;
   }
 

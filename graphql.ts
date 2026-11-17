@@ -40,6 +40,8 @@ export interface GraphqlHandlerCtx {
   viewerLogin?: string;
   body?: string;
   parsedBody?: unknown;
+  /** Pathname app.ts already split out of req.url. */
+  path?: string;
 }
 
 export type GraphqlHandler = (req: IncomingMessage, res: ServerResponse, ctx?: GraphqlHandlerCtx) => boolean;
@@ -1106,12 +1108,9 @@ export function createGraphqlHandler(store: Store, opts: HandlerOpts = {}): Grap
   }
 
   return (req: IncomingMessage, res: ServerResponse, ctx?: GraphqlHandlerCtx): boolean => {
-    let pathname = '/';
-    try {
-      pathname = new URL(req.url ?? '/', 'http://entry').pathname;
-    } catch {
-      pathname = '/';
-    }
+    const rawUrl = req.url ?? '/';
+    const q = rawUrl.indexOf('?');
+    const pathname = ctx?.path ?? (q < 0 ? rawUrl : rawUrl.slice(0, q));
     if ((req.method ?? 'GET').toUpperCase() !== 'POST' || pathname !== '/api/graphql') return false;
     void handle(req, res, ctx).catch(() => {
       try {

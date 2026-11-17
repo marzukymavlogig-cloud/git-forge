@@ -40,6 +40,8 @@ export interface McpHandlerContext {
   viewer?: string;
   login?: string;
   token?: string;
+  /** Pathname app.ts already split out of req.url. */
+  path?: string;
 }
 
 /** The current MCP revision this server speaks. */
@@ -464,12 +466,9 @@ export function createMcpHandler(store: Store, opts: McpHandlerOptions = {}): (r
   const fallbackViewer = opts.viewer ?? store.viewerLogin ?? undefined;
 
   return (req: IncomingMessage, res: ServerResponse, ctx?: McpHandlerContext | null): boolean => {
-    let path = '/';
-    try {
-      path = new URL(req.url ?? '/', 'http://entry').pathname;
-    } catch {
-      path = '/';
-    }
+    const rawUrl = req.url ?? '/';
+    const q = rawUrl.indexOf('?');
+    const path = ctx?.path ?? (q < 0 ? rawUrl : rawUrl.slice(0, q));
     if (path !== '/mcp' && path !== '/mcp/') return false;
 
     void (async () => {

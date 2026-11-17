@@ -19,6 +19,8 @@ import {
   deleteContent,
   getContent,
   issueJson,
+  issueJsonBuffer,
+  issueJsonText,
   labelJson,
   listIssueComments,
   listIssues,
@@ -49,6 +51,8 @@ export interface RestHandlerCtx {
   body?: string;
   /** Pre-parsed JSON body. */
   parsedBody?: unknown;
+  /** Pathname app.ts already split out of req.url (avoids a second URL parse). */
+  path?: string;
 }
 
 export type RestHandler = (req: IncomingMessage, res: ServerResponse, ctx?: RestHandlerCtx) => boolean;
@@ -121,6 +125,18 @@ export function createRestHandler(store: Store, opts: RestHandlerOpts = {}): Res
     res.end(text);
   }
 
+  function sendRaw(res: ServerResponse, status: number, body: string | Buffer, extra: Record<string, string> = {}): void {
+    requestCounter += 1;
+    const headers: Record<string, string> = {
+      'content-type': JSON_TYPE,
+      'x-github-request-id': `req-${requestCounter}`,
+      'content-length': String(Buffer.byteLength(body)),
+      ...extra,
+    };
+    res.writeHead(status, headers);
+    res.end(body);
+  }
+
   function sendError(res: ServerResponse, status: number, message: string): void {
     send(res, status, { message, documentation_url: 'https://docs.github.com/rest' });
   }
@@ -138,16 +154,25 @@ export function createRestHandler(store: Store, opts: RestHandlerOpts = {}): Res
 
   async function handle(req: IncomingMessage, res: ServerResponse, ctx: RestHandlerCtx | undefined): Promise<void> {
     const method = (req.method ?? 'GET').toUpperCase();
-    let url: URL;
-    try {
-      url = new URL(req.url ?? '/', 'http://entry');
-    } catch {
-      sendError(res, 400, 'Bad Request');
-      return;
+    const rawUrl = req.url ?? '/';
+    // Pathname without a URL parse when app.ts already supplied one; fall
+    // back to `new URL` for dot segments, which the manual split does not
+    // normalise the way URL does.
+    let pathname = ctx?.path;
+    if (pathname === undefined || pathname.includes('/./') || pathname.includes('/../') || pathname.includes('//')) {
+      try {
+        pathname = new URL(rawUrl, 'http://entry').pathname;
+      } catch {
+        sendError(res, 400, 'Bad Request');
+        return;
+      }
     }
-    const pathname = url.pathname;
     const segs = pathname.split('/').filter((s) => s !== '').map(decode);
-    const query = parseQuery(url);
+    const q = rawUrl.indexOf('?');
+    const query: Record<string, string> = {};
+    if (q >= 0) {
+      for (const [k, v] of new URLSearchParams(rawUrl.slice(q + 1))) query[k] = v;
+    }
     const baseUrl = ctx?.baseUrl ?? opts.baseUrl ?? `http://${req.headers.host ?? 'localhost'}`;
     if (ctx?.viewerLogin) store.learnViewer(ctx.viewerLogin);
 
@@ -354,7 +379,7 @@ export function createRestHandler(store: Store, opts: RestHandlerOpts = {}): Res
         if (rest.length === 1) {
           if (method === 'POST') {
             const issue = createIssue(store, repo, { title: String(input.title ?? ''), body: typeof input.body === 'string' ? input.body : undefined, labels: input.labels });
-            send(res, 201, issueJson(store, repo, issue));
+            sendRaw(res, 201, issueJsonBuffer(store, repo, issue));
             return;
           }
           if (method === 'GET') {
@@ -367,7 +392,8 @@ export function createRestHandler(store: Store, opts: RestHandlerOpts = {}): Res
           const issue = repo.issues.get(num);
           if (!issue) throw apiError(404, 'Not Found');
           if (method === 'GET') {
-            send(res, 200, issueJson(store, repo, issue));
+            // Hot path (the read workload): the body is cached per issue.
+            sendRaw(res, 200, issueJsonBuffer(store, repo, issue));
             return;
           }
           if (method === 'PATCH') {
@@ -430,14 +456,11 @@ export function createRestHandler(store: Store, opts: RestHandlerOpts = {}): Res
   }
 
   return (req: IncomingMessage, res: ServerResponse, ctx?: RestHandlerCtx): boolean => {
-    let pathname = '/';
-    try {
-      pathname = new URL(req.url ?? '/', 'http://entry').pathname;
-    } catch {
-      pathname = '/';
-    }
+    const rawUrl = req.url ?? '/';
+    const q = rawUrl.indexOf('?');
+    const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
     if (pathname !== '/api/v3' && pathname !== '/api/v3/' && !pathname.startsWith('/api/v3/')) return false;
-    void handle(req, res, ctx).catch(() => {
+    void handle(req, res, ctx === undefined ? { path: pathname } : { ...ctx, path: ctx.path ?? pathname }).catch(() => {
       try {
         if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
         else res.end();

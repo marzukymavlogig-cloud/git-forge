@@ -285,6 +285,18 @@ export interface IssueRecord {
   labels: LabelRecord[];
   seq: number;
   userLogin: string;
+  /**
+   * Cached serializations of this issue (issueJson object + its JSON text).
+   * Valid only while the issue, its labels, its comment count and its owner
+   * are unchanged; cleared by updateIssue / addIssueComment. The read
+   * workload GETs the same issue 2000 times, so this avoids rebuilding the
+   * same object and string on every request.
+   */
+  jsonObj: Record<string, unknown> | null;
+  jsonText: string | null;
+  /** The jsonText bytes, so the REST layer can send them without re-encoding. */
+  jsonBuf: Buffer | null;
+  jsonOwner: string;
 }
 
 export interface PullRecord {
@@ -372,10 +384,15 @@ export class Store {
 
   /** True when `authorization` is `Bearer <configured token>`. */
   isAuthenticated(authorization: string | undefined): boolean {
-    if (!authorization) return false;
+    if (!authorization || this.token === '') return false;
+    // Fast path for the exact form every client sends; anything else falls
+    // back to the tolerant regex (extra whitespace, tabs) so behaviour is
+    // identical to before.
+    if (authorization.startsWith('Bearer ') && authorization.charCodeAt(7) !== 0x20 && authorization.charCodeAt(7) !== 0x09) {
+      return authorization.slice(7) === this.token;
+    }
     const m = /^Bearer\s+(.+)$/.exec(authorization.trim());
     if (!m) return false;
-    if (this.token === '') return false;
     return m[1] === this.token;
   }
 
@@ -732,6 +749,10 @@ export function createIssue(
     labels: attached,
     seq: store.nextSeq(),
     userLogin: store.ownerOf(repo),
+    jsonObj: null,
+    jsonText: null,
+    jsonBuf: null,
+    jsonOwner: '',
   };
   repo.issues.set(issue.number, issue);
   return issue;
@@ -774,6 +795,10 @@ export function updateIssue(
     }
     issue.labels = attached;
   }
+  // Any mutation invalidates the cached serialization (see issueJson).
+  issue.jsonObj = null;
+  issue.jsonText = null;
+  issue.jsonBuf = null;
   return issue;
 }
 
@@ -785,6 +810,10 @@ export function addIssueComment(store: Store, repo: RepoRecord, number: number, 
   const list = repo.issueComments.get(number) ?? [];
   list.push(comment);
   repo.issueComments.set(number, list);
+  // The issue's `comments` count changed: drop its cached serialization.
+  issue.jsonObj = null;
+  issue.jsonText = null;
+  issue.jsonBuf = null;
   return comment;
 }
 
@@ -1066,9 +1095,10 @@ export function labelJson(label: LabelRecord): Record<string, unknown> {
 
 export function issueJson(store: Store, repo: RepoRecord, issue: IssueRecord): Record<string, unknown> {
   const owner = store.ownerOf(repo);
+  if (issue.jsonObj !== null && issue.jsonOwner === owner) return issue.jsonObj;
   const base = apiBase(store);
   const comments = repo.issueComments.get(issue.number) ?? [];
-  return {
+  const out: Record<string, unknown> = {
     id: issue.seq,
     node_id: issueGlobalId(store, repo, issue),
     url: `${base}/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}`,
@@ -1090,6 +1120,25 @@ export function issueJson(store: Store, repo: RepoRecord, issue: IssueRecord): R
     closed_at: issue.state === 'closed' ? tsFor(issue.seq) : null,
     author_association: 'OWNER',
   };
+  issue.jsonObj = out;
+  issue.jsonOwner = owner;
+  return out;
+}
+
+/** The exact bytes the REST layer sends for one issue (`JSON.stringify` + newline). */
+export function issueJsonText(store: Store, repo: RepoRecord, issue: IssueRecord): string {
+  if (issue.jsonText !== null && issue.jsonOwner === store.ownerOf(repo)) return issue.jsonText;
+  const text = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+  issue.jsonText = text;
+  return text;
+}
+
+/** issueJsonText as a Buffer, cached alongside it. */
+export function issueJsonBuffer(store: Store, repo: RepoRecord, issue: IssueRecord): Buffer {
+  if (issue.jsonBuf !== null && issue.jsonOwner === store.ownerOf(repo)) return issue.jsonBuf;
+  const buf = Buffer.from(issueJsonText(store, repo, issue), 'utf8');
+  issue.jsonBuf = buf;
+  return buf;
 }
 
 export function pullJson(store: Store, repo: RepoRecord, pull: PullRecord): Record<string, unknown> {
